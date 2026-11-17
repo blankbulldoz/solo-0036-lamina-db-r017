@@ -49,7 +49,16 @@ func (s *Server) deleteRow(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, map[string]string{"state": "staged"})
 }
 func (s *Server) commit(w http.ResponseWriter, r *http.Request) {
-	out, err := s.db.Commit(r.PathValue("tx"))
+	// The body is optional: existing clients still POST an empty body. When a
+	// body is present it must be one JSON value naming a client request
+	// identity for durable deduplication.
+	var in struct {
+		RequestID string `json:"request_id"`
+	}
+	if !decodeOptional(w, r, &in) {
+		return
+	}
+	out, err := s.db.Commit(r.PathValue("tx"), in.RequestID)
 	if err != nil {
 		respondError(w, err)
 		return

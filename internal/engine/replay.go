@@ -54,12 +54,19 @@ func (d *DB) apply(r journal.Record) error {
 			}
 		}
 		d.store.Apply(r.Sequence, r.Writes)
+		if r.Request != nil {
+			if prior, ok := d.requests[r.Request.ID]; ok && prior.Fingerprint != r.Request.Fingerprint {
+				return journalIdentityFault(r.Request.ID)
+			}
+			d.registerRequest(r.Request, r.Sequence, len(r.Writes))
+		}
 	case "vacuum":
 		if r.Horizon < d.horizon || r.Horizon > d.sequence {
 			return fmt.Errorf("invalid vacuum horizon")
 		}
 		d.store.Vacuum(r.Horizon)
 		d.horizon = r.Horizon
+		d.expireRequests(r.Horizon)
 	default:
 		return fmt.Errorf("unknown record kind %s", r.Kind)
 	}

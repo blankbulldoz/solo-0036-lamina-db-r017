@@ -24,6 +24,7 @@ type Transaction struct {
 type Commit struct {
 	Sequence uint64 `json:"sequence"`
 	Writes   int    `json:"writes"`
+	Replayed bool   `json:"replayed"`
 }
 
 func (d *DB) Begin(readOnly bool) (Transaction, error) {
@@ -152,32 +153,33 @@ func (d *DB) Rollback(id string) error {
 	delete(d.transactions, id)
 	return nil
 }
-func (d *DB) Commit(id string) (Commit, error) {
+func (d *DB) Commit(id string, requestID string) (Commit, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
 		return Commit{}, err
+	}
+	if requestID != "" {
+		if err := validRequestID(requestID); err != nil {
+			return Commit{}, err
+		}
 	}
 	tx, err := d.tx(id)
 	if err != nil {
 		return Commit{}, err
 	}
 	defer delete(d.transactions, id)
+	// Build and canonicalize the exact logical write set first. The payload is
+	// the same whether this is a first publish or a disconnected retry, so its
+	// fingerprint is stable across restarts and instances.
 	writes := make([]versions.Mutation, 0)
-	for table, mutations := range tx.writes {
-		for key, m := range mutations {
-			if d.store.Latest(table, key) > tx.Snapshot {
-				d.conflicts++
-				return Commit{}, fault("conflict", "write conflict on %s", table)
-			}
+	for _, mutations := range tx.writes {
+		for _, m := range mutations {
 			writes = append(writes, m.Mutation)
-		}
-		if err = d.unique(table, tx.writes); err != nil {
-			d.conflicts++
-			return Commit{}, err
 		}
 	}
 	if len(writes) == 0 {
+		// No write is published, so an identity cannot be bound to a result.
 		return Commit{Sequence: tx.Snapshot}, nil
 	}
 	sort.Slice(writes, func(i, j int) bool {
@@ -186,7 +188,42 @@ func (d *DB) Commit(id string) (Commit, error) {
 		}
 		return writes[i].Relation < writes[j].Relation
 	})
-	if err = d.publish(journal.Record{Kind: "commit", Transaction: id, Writes: writes}); err != nil {
+	fingerprint := writeFingerprint(writes)
+	// Identity resolution precedes the first-committer-wins and unique checks.
+	// A bound identity is a lookup of an already determined durable result, not
+	// a new write: an identical retry must converge to it even when the retry
+	// transaction opened before the original publish and would otherwise look
+	// like a stale snapshot. A different payload is rejected, so one identity
+	// can never represent two different committed results.
+	if requestID != "" {
+		if prior, ok := d.requests[requestID]; ok {
+			if prior.Fingerprint != fingerprint {
+				d.replayRejects++
+				return Commit{}, fault("conflict", "request identity %q already committed with a different write payload", requestID)
+			}
+			d.replayReplays++
+			return Commit{Sequence: prior.Sequence, Writes: prior.Writes, Replayed: true}, nil
+		}
+	}
+	// Only genuinely new writes run the normal fact-source checks: first
+	// committer wins on each key, then unique constraints on the final state.
+	for table, mutations := range tx.writes {
+		for key := range mutations {
+			if d.store.Latest(table, key) > tx.Snapshot {
+				d.conflicts++
+				return Commit{}, fault("conflict", "write conflict on %s", table)
+			}
+		}
+		if err = d.unique(table, tx.writes); err != nil {
+			d.conflicts++
+			return Commit{}, err
+		}
+	}
+	var identity *journal.RequestIdentity
+	if requestID != "" {
+		identity = &journal.RequestIdentity{ID: requestID, Fingerprint: fingerprint}
+	}
+	if err = d.publish(journal.Record{Kind: "commit", Transaction: id, Writes: writes, Request: identity}); err != nil {
 		return Commit{}, err
 	}
 	d.commits++

@@ -368,6 +368,28 @@
       "success": "query execution facts and database resource state produces a verified domain result",
       "failure": "candidates vs scanned vs returned have distinct meanings",
       "verification": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "id": "request-identity",
+      "name": "durable request-level commit identity and bounded dedup retention",
+      "entry": "POST /transactions/{tx}/commit with request_id and GET /requests/{request}",
+      "steps": [
+        "transport",
+        "engine",
+        "journal",
+        "versions",
+        "snapshot"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "journal",
+        "versions",
+        "snapshot"
+      ],
+      "success": "one request identity represents exactly one determined commit result across retries and restart",
+      "failure": "same identity with a different payload is rejected; expired or out-of-range identities fall back to data-level reconciliation",
+      "verification": "python3 examples/walkthrough.py --workflow request-identity"
     }
   ],
   "complexity": {

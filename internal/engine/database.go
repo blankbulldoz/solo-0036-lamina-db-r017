@@ -13,19 +13,24 @@ import (
 )
 
 type DB struct {
-	mu           sync.RWMutex
-	dir          string
-	catalog      *catalog.Catalog
-	store        *versions.Store
-	indexes      *index.Registry
-	wal          *journal.WAL
-	sequence     uint64
-	horizon      uint64
-	transactions map[string]*Transaction
-	closed       bool
-	commits      uint64
-	conflicts    uint64
-	queries      uint64
+	mu            sync.RWMutex
+	dir           string
+	catalog       *catalog.Catalog
+	store         *versions.Store
+	indexes       *index.Registry
+	wal           *journal.WAL
+	sequence      uint64
+	horizon       uint64
+	transactions  map[string]*Transaction
+	requests      map[string]*RequestOutcome
+	requestOrder  []requestSeq
+	requestHead   int
+	replayRejects uint64
+	replayReplays uint64
+	closed        bool
+	commits       uint64
+	conflicts     uint64
+	queries       uint64
 }
 
 func Open(dir string) (*DB, error) {
@@ -47,7 +52,7 @@ func Open(dir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
+	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}, requests: map[string]*RequestOutcome{}}
 	if !missing {
 		d.catalog = image.Catalog
 		d.store = image.Store
@@ -59,8 +64,15 @@ func Open(dir string) (*DB, error) {
 		w.Close()
 		return nil, fmt.Errorf("checkpoint ahead of journal")
 	}
+	// The checkpoint image already contains the effects of records at or
+	// before its sequence, but the identity index is journal-derived and is
+	// not stored in images: rebuild it from the full durable log first.
 	for _, r := range w.Records {
 		if r.Sequence <= d.sequence {
+			if err = d.recoverIdentity(r); err != nil {
+				w.Close()
+				return nil, err
+			}
 			continue
 		}
 		if err = d.apply(r); err != nil {

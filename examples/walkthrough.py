@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','request-identity']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -36,6 +36,8 @@ class Session:
  def begin(self,readonly=False):return self.call('POST','/transactions',{'read_only':readonly},201)['id']
  def put(self,tx,row,status=200,insert=False):return self.call('POST',f'/transactions/{tx}/put',{'relation':'spectra','row':row,'insert_only':insert},status)
  def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
+ def commit_id(self,tx,request_id,status=200):return self.call('POST',f'/transactions/{tx}/commit',{'request_id':request_id},status)
+ def request_status(self,request_id,status=200):return self.call('GET',f'/requests/{request_id}',status=status)
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
@@ -152,6 +154,108 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='request-identity':
+    # A: acknowledgement lost -> identical retry replays the exact commit
+    rid='demo-request-0001'
+    first=s.begin();s.put(first,tuple_(20),insert=True)
+    first_result=s.commit_id(first,rid)
+    require(first_result['replayed'] is False and first_result['writes']==1,'first identity binding must publish')
+    lookup=s.request_status(rid)
+    require(lookup['status']=='committed' and lookup['sequence']==first_result['sequence'],'identity lookup lost the determined result')
+    retry=s.begin();s.put(retry,tuple_(20))
+    retry_result=s.commit_id(retry,rid)
+    require(retry_result['replayed'] and retry_result['sequence']==first_result['sequence'] and retry_result['writes']==1,'identical retry did not replay the same result')
+    require(s.query()['matched']==8 and s.stats()['sequence']==first_result['sequence'],'retry opened a second write path')
+    # B: the same identity carrying a different logical write is rejected
+    bad=s.begin();s.put(bad,tuple_(20,amplitude=777))
+    mismatch=s.commit_id(bad,'demo-request-0001',409)
+    require('different write payload' in mismatch['error']['message'],'identity payload collision was not rejected')
+    require(s.request_status(rid)['sequence']==first_result['sequence'],'rejected attempt mutated the bound result')
+    require(s.query(where=[{'column':'sample','op':'=','value':20}])['rows'][0]['amplitude']==200,'rejected attempt changed committed data')
+    s.call('POST',f'/transactions/{bad}/rollback',status=404)  # failed commit closed it
+    # C: an identity is bound only after the write is durably committed
+    unbound='demo-request-never-committed'
+    failed=s.begin();s.put(failed,tuple_(21,amplitude=1))
+    s.put(failed,{'sample':21,'band':'bad-type','amplitude':'not-an-int','valid':True},400)
+    s.call('POST',f'/transactions/{failed}/rollback')
+    s.request_status(unbound,404)
+    rebound=s.begin();s.put(rebound,tuple_(21),insert=True)
+    rebound_result=s.commit_id(rebound,unbound)
+    require(rebound_result['replayed'] is False,'a never-published identity was treated as a replay')
+    require(s.request_status(unbound)['sequence']==rebound_result['sequence'],'published identity was not registered')
+    s.commit_id(s.begin(),' x',400)
+    # D: concurrent attempts. Two fresh writers using the SAME request
+    # identity are not two logical writes: the global commit lock serializes
+    # them, the first publishes, and the second is resolved as an identity
+    # replay before first-committer-wins could reject its stale snapshot.
+    # Two distinct identities racing the same key still obey first-committer-
+    # wins. In neither case can the logical write be published twice.
+    cid='demo-request-concurrent'
+    head_before=s.stats()['sequence']
+    def identified_commit():
+     tx=s.begin();s.put(tx,tuple_(30));return s.commit_id(tx,cid)
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+     jobs=[pool.submit(identified_commit),pool.submit(identified_commit)]
+     outcomes=[job.result() for job in jobs]
+    require(sum(o['replayed'] for o in outcomes)==1,'concurrent same-identity attempts must yield one publish and one replay')
+    winner=next(o for o in outcomes if not o['replayed'])
+    require(all(o['sequence']==winner['sequence'] for o in outcomes),'both attempts must name the same commit')
+    require(s.stats()['sequence']==head_before+1,'concurrent retry consumed a second sequence')
+    require(s.query(where=[{'column':'sample','op':'=','value':30}])['matched']==1,'concurrent retry duplicated the row')
+    require(s.request_status(cid)['sequence']==winner['sequence'],'identity did not converge to the single publish')
+    # distinct identities on the same key are still first-committer-wins
+    def distinct_commit(rid):
+     tx=s.begin();s.put(tx,tuple_(31));return s.commit_id(tx,rid)
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+     jobs=[pool.submit(distinct_commit,'distinct-a'),pool.submit(distinct_commit,'distinct-b')]
+     raced=[]
+     for job in jobs:
+      try:raced.append(job.result())
+      except RuntimeError as e:
+       require('got 409' in str(e) and 'write conflict' in str(e),'unexpected distinct-identity failure');raced.append({'conflict':True})
+    require(sum('conflict' in o for o in raced)==1,'distinct identities must keep first-committer-wins semantics')
+    # E: durability across restart; the index is rebuilt from the journal
+    s.stop();s.start()
+    survived=s.request_status(rid)
+    require(survived['sequence']==first_result['sequence'] and survived['status']=='committed','identity outcome did not survive restart')
+    after_restart=s.begin();s.put(after_restart,tuple_(20))
+    replayed_after=s.commit_id(after_restart,rid)
+    require(replayed_after['replayed'] and replayed_after['sequence']==first_result['sequence'],'post-restart replay diverged')
+    # seeded 7 rows plus the four distinct new rows (20,21,30,31); no duplicates
+    require(s.query()['matched']==11,'restart replay created a duplicate write')
+    # F: vacuum horizon is the durable retention deadline; expiry forces
+    # data-level reconciliation rather than an uncontrolled re-write
+    expiry_id='demo-request-expiry'
+    expiring=s.begin();s.put(expiring,tuple_(40),insert=True)
+    expiry_commit=s.commit_id(expiring,expiry_id)
+    horizon=s.stats()['sequence']
+    reclaimed=s.call('POST','/vacuum',{'horizon':horizon})
+    require(reclaimed['horizon']==horizon,'vacuum horizon did not advance')
+    expired=s.request_status(expiry_id,404)
+    require('retention floor' in expired['error']['message'],'expiry did not expose the retention floor')
+    require(s.stats()['request_retention_floor']>=horizon,'retention floor lagged the horizon')
+    # documented client reconciliation: inspect the actual data first
+    existing=s.query(where=[{'column':'sample','op':'=','value':40}])
+    require(existing['matched']==1 and existing['rows'][0]['amplitude']==400,'committed data must remain queryable after identity expiry')
+    # blindly repeating the same insert-only write is stopped by the PK fact
+    blind=s.begin()
+    blind_put=s.put(blind,tuple_(40),insert=True,status=409)
+    require('primary already exists' in blind_put['error']['message'],'expired identity bypassed the primary key fact')
+    s.call('POST',f'/transactions/{blind}/rollback')
+    # a genuinely new write under an expired identity is a fresh attempt
+    fresh=s.begin();s.put(fresh,tuple_(41),insert=True)
+    fresh_commit=s.commit_id(fresh,expiry_id)
+    require(fresh_commit['replayed'] is False and fresh_commit['sequence']>expiry_commit['sequence'],'expired identity was silently resurrected')
+    # G: a restored instance answers identities only inside its own range
+    backup=s.call('GET','/backup',raw=True);image_path=temp/'identity-backup.lmi';image_path.write_bytes(backup)
+    other=Session(binary,temp/'identity-restored',image_path).start()
+    other.request_status(rid,404)
+    restored_rid='demo-request-after-restore'
+    rtx=other.begin();other.put(rtx,tuple_(50),insert=True)
+    restored_commit=other.commit_id(rtx,restored_rid)
+    require(restored_commit['replayed'] is False and other.request_status(restored_rid)['sequence']==restored_commit['sequence'],'restored instance refused a new identity')
+    other.stop()
+    observations={'replay':retry_result,'mismatch':mismatch,'concurrent':{'same_identity':outcomes,'distinct_identity':raced},'survived':survived,'expired_floor':s.stats()['request_retention_floor'],'restored':{'old_identity':'unknown_in_restored_range','new_commit':restored_commit}}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:
